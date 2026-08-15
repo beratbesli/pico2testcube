@@ -1,13 +1,9 @@
 /**
- * Pico 2 (RP2350) - 125-Cube 3D ASCII Stress Test & Benchmark
+ * Pico 2 (RP2350) - Out-of-Core Virtual Memory 3D Render Engine
  * 
- * Hardware Benchmark for Raspberry Pi Pico 2:
- * - 125 Simultaneous 3D Cubes (5x5x5 Matrix)
- * - 1,000 Vertices transformed & projected per frame
- * - 1,500 Wireframe Edges rasterized with hardware FPU
- * - Full 2D ASCII Z-Buffer (Depth Buffer) with distance-shading
- * - Real-time Microsecond Hardware Benchmark Telemetry
- * - USB CDC Stdio Serial Output
+ * Demonstrates rendering a massive 1,000,000 byte (1 MB) 3D world
+ * that exceeds Pico 2's total RAM by paging 512-byte blocks
+ * to and from an SPI0 MicroSD card via an LRU Page Cache (16 KB RAM).
  */
 
 #include <stdio.h>
@@ -15,334 +11,226 @@
 #include <string.h>
 #include <math.h>
 #include "pico/stdlib.h"
-#include "pico/multicore.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
+#include "sd_spi.h"
+#include "vmem_fb.h"
 
-// Screen buffer dimensions (terminal columns & rows)
-#define SCREEN_WIDTH   80
-#define SCREEN_HEIGHT  34
+#define VIEWPORT_WIDTH   80
+#define VIEWPORT_HEIGHT  32
 
-// Aspect ratio compensation for typical monospace terminal fonts (~2.1:1 height:width)
-#define FONT_ASPECT    2.15f
+static char terminal_buf[VIEWPORT_HEIGHT][VIEWPORT_WIDTH];
+static char output_str[16384];
 
-// Grid Configuration (5 x 5 x 5 = 125 Cubes)
-#define GRID_DIM       5
-#define TOTAL_CUBES    (GRID_DIM * GRID_DIM * GRID_DIM) // 125
-#define VERTS_PER_CUBE 8
-#define EDGES_PER_CUBE 12
-#define TOTAL_VERTS    (TOTAL_CUBES * VERTS_PER_CUBE)   // 1,000
-#define TOTAL_EDGES    (TOTAL_CUBES * EDGES_PER_CUBE)   // 1,500
+// Draw a 3D wireframe cube directly into the Virtual Memory space
+static void vmem_render_3d_cube(int center_x, int center_y, float size, float rx, float ry, float rz, char ch) {
+    // 8 vertices of unit cube
+    static const float base_v[8][3] = {
+        {-1,-1,-1}, {1,-1,-1}, {1,1,-1}, {-1,1,-1},
+        {-1,-1,1},  {1,-1,1},  {1,1,1},  {-1,1,1}
+    };
+    static const int edges[12][2] = {
+        {0,1},{1,2},{2,3},{3,0},
+        {4,5},{5,6},{6,7},{7,4},
+        {0,4},{1,5},{2,6},{3,7}
+    };
 
-typedef struct {
-    float x, y, z;
-} Vec3;
+    float cx = cosf(rx), sx = sinf(rx);
+    float cy = cosf(ry), sy = sinf(ry);
+    float cz = cosf(rz), sz = sinf(rz);
 
-typedef struct {
-    int v0, v1;
-} Edge;
+    int px[8], py[8];
 
-// Unit cube vertices (-1 to +1)
-static const Vec3 base_cube_verts[VERTS_PER_CUBE] = {
-    { -1.0f, -1.0f, -1.0f },
-    {  1.0f, -1.0f, -1.0f },
-    {  1.0f,  1.0f, -1.0f },
-    { -1.0f,  1.0f, -1.0f },
-    { -1.0f, -1.0f,  1.0f },
-    {  1.0f, -1.0f,  1.0f },
-    {  1.0f,  1.0f,  1.0f },
-    { -1.0f,  1.0f,  1.0f }
-};
+    for (int i = 0; i < 8; i++) {
+        float x = base_v[i][0] * size;
+        float y = base_v[i][1] * size;
+        float z = base_v[i][2] * size;
 
-// 12 edges per cube
-static const Edge base_cube_edges[EDGES_PER_CUBE] = {
-    { 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 0 }, // Back
-    { 4, 5 }, { 5, 6 }, { 6, 7 }, { 7, 4 }, // Front
-    { 0, 4 }, { 1, 5 }, { 2, 6 }, { 3, 7 }  // Connectors
-};
+        // Rotation
+        float x1 = x;
+        float y1 = y * cx - z * sx;
+        float z1 = y * sx + z * cx;
 
-// Global frame and depth buffer
-static char  frame_buf[SCREEN_HEIGHT][SCREEN_WIDTH];
-static float z_buffer[SCREEN_HEIGHT][SCREEN_WIDTH];
-static char  output_buf[32768];
+        float x2 = x1 * cy + z1 * sy;
+        float y2 = y1;
+        float z2 = -x1 * sy + z1 * cy;
 
-// Projected vertex cache
-static int   proj_x[TOTAL_VERTS];
-static int   proj_y[TOTAL_VERTS];
-static float proj_z[TOTAL_VERTS];
+        float x3 = x2 * cz - y2 * sz;
+        float y3 = x2 * sz + y2 * cz;
 
-// Clear the frame buffer and reset Z-buffer
-static void clear_buffers(void) {
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            frame_buf[y][x] = ' ';
-            z_buffer[y][x]  = 1e9f; // Far plane
-        }
+        px[i] = center_x + (int)(x3 * 2.0f); // Font aspect ratio correction
+        py[i] = center_y - (int)y3;
+    }
+
+    for (int i = 0; i < 12; i++) {
+        int i0 = edges[i][0];
+        int i1 = edges[i][1];
+        vmem_draw_line(px[i0], py[i0], px[i1], py[i1], ch);
     }
 }
 
-// Select ASCII character based on depth (closer = denser/brighter)
-static inline char depth_to_char(float z) {
-    if (z < 3.8f) return '@';
-    if (z < 4.8f) return '#';
-    if (z < 6.0f) return '*';
-    if (z < 7.4f) return '+';
-    if (z < 9.0f) return ':';
-    return '.';
-}
+// Generate a massive 1,000,000 byte 3D landscape on the SD card
+static void generate_massive_world(void) {
+    printf("[RENDER] Initializing 1,000,000 byte Virtual World on MicroSD...\n");
+    vmem_clear(' ');
 
-// Bresenham's line algorithm with Z-Buffer depth interpolation
-static void draw_line_z(int x0, int y0, float z0, int x1, int y1, float z1) {
-    int dx = abs(x1 - x0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int dy = -abs(y1 - y0);
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
+    // 1. Draw outer boundary box (1000 x 1000)
+    vmem_draw_box(0, 0, VMEM_WIDTH, VMEM_HEIGHT);
 
-    int steps = (dx > -dy) ? dx : -dy;
-    if (steps == 0) steps = 1;
-    float z_step = (z1 - z0) / (float)steps;
-    float cur_z = z0;
-
-    int cur_x = x0;
-    int cur_y = y0;
-
-    while (1) {
-        if (cur_x >= 1 && cur_x < SCREEN_WIDTH - 1 && cur_y >= 1 && cur_y < SCREEN_HEIGHT - 1) {
-            if (cur_z < z_buffer[cur_y][cur_x]) {
-                z_buffer[cur_y][cur_x] = cur_z;
-                frame_buf[cur_y][cur_x] = depth_to_char(cur_z);
-            }
-        }
-        if (cur_x == x1 && cur_y == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) {
-            err += dy;
-            cur_x += sx;
-        }
-        if (e2 <= dx) {
-            err += dx;
-            cur_y += sy;
-        }
-        cur_z += z_step;
-    }
-}
-
-// Draw decorative border frame
-static void draw_border(void) {
-    for (int x = 0; x < SCREEN_WIDTH; x++) {
-        frame_buf[0][x] = '=';
-        frame_buf[SCREEN_HEIGHT - 1][x] = '=';
-    }
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        frame_buf[y][0] = '|';
-        frame_buf[y][SCREEN_WIDTH - 1] = '|';
-    }
-    frame_buf[0][0] = '+';
-    frame_buf[0][SCREEN_WIDTH - 1] = '+';
-    frame_buf[SCREEN_HEIGHT - 1][0] = '+';
-    frame_buf[SCREEN_HEIGHT - 1][SCREEN_WIDTH - 1] = '+';
-}
-
-// Render text into the frame buffer at given position
-static void draw_string(int x, int y, const char *str) {
-    int len = (int)strlen(str);
-    for (int i = 0; i < len; i++) {
-        int px = x + i;
-        if (px >= 1 && px < SCREEN_WIDTH - 1 && y >= 0 && y < SCREEN_HEIGHT) {
-            frame_buf[y][px] = str[i];
+    // 2. Draw coordinate grid lines every 100 characters
+    for (int x = 100; x < VMEM_WIDTH; x += 100) {
+        for (int y = 10; y < VMEM_HEIGHT - 10; y += 4) {
+            vmem_put_pixel(x, y, ':');
         }
     }
+    for (int y = 100; y < VMEM_HEIGHT; y += 100) {
+        for (int x = 10; x < VMEM_WIDTH - 10; x += 4) {
+            vmem_put_pixel(x, y, '-');
+        }
+    }
+
+    // 3. Draw a constellation of 3D cubes of various sizes across virtual space
+    printf("[RENDER] Paging 3D Cubes into Virtual Framebuffer...\n");
+    for (int gy = 150; gy < VMEM_HEIGHT - 100; gy += 200) {
+        for (int gx = 150; gx < VMEM_WIDTH - 100; gx += 200) {
+            float size = 25.0f + 10.0f * sinf((float)(gx + gy) * 0.05f);
+            float angle = (float)(gx * 3 + gy * 7) * 0.02f;
+            vmem_render_3d_cube(gx, gy, size, angle, angle * 1.5f, angle * 0.7f, '#');
+
+            char label[32];
+            snprintf(label, sizeof(label), "[SECTOR %03d,%03d]", gx, gy);
+            vmem_draw_string(gx - 8, gy + (int)size + 3, label);
+        }
+    }
+
+    // 4. Draw Center Mega Landmark
+    vmem_draw_box(400, 420, 200, 160);
+    vmem_draw_string(410, 430, "=== PICO 2 (RP2350) OUT-OF-CORE VIRTUAL MEMORY ===");
+    vmem_draw_string(410, 445, "CANVAS SIZE : 1000 x 1000 CHARACTERS (1.00 MEGABYTE)");
+    vmem_draw_string(410, 460, "RAM FOOTPRINT : ONLY 16 KB (32-PAGE LRU CACHE)");
+    vmem_draw_string(410, 475, "SECONDARY DISK: 2GB SPI0 MICROSD CARD @ 20 MHz");
+    vmem_render_3d_cube(500, 520, 35.0f, 0.6f, 0.8f, 0.4f, '@');
+
+    // 5. Commit all modified pages to MicroSD card
+    printf("[RENDER] Flushing dirty pages to SD card...\n");
+    vmem_flush();
+    printf("[RENDER] Virtual World Generation Complete!\n");
 }
 
 int main(void) {
-    // Initialize standard I/O (USB CDC)
     stdio_init_all();
 
-    // Initialize onboard LED (GPIO 25)
 #ifdef PICO_DEFAULT_LED_PIN
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     gpio_put(PICO_DEFAULT_LED_PIN, 1);
 #endif
 
-    // Cluster & Local Rotation Angles (radians)
-    float world_rx = 0.4f;
-    float world_ry = 0.0f;
-    float world_rz = 0.2f;
+    sleep_ms(2000);
 
-    float local_rx = 0.0f;
-    float local_ry = 0.0f;
+    printf("\n======================================================\n");
+    printf("  PICO 2 (RP2350) OUT-OF-CORE VIRTUAL MEMORY DEMO\n");
+    printf("  SPI0 Pinout: MISO=GP16, CS=GP17, SCK=GP18, MOSI=GP19\n");
+    printf("======================================================\n\n");
 
+    // Initialize SD card on SPI0
+    bool sd_ok = sd_spi_init();
+    if (!sd_ok) {
+        printf("\n[ERROR] MicroSD card initialization failed on SPI0!\n");
+        printf("Please verify:\n");
+        printf("  - MISO -> GP16\n  - CS   -> GP17\n  - SCK  -> GP18\n  - MOSI -> GP19\n  - VCC  -> 3V3(OUT)\n");
+        while (1) {
+            tight_loop_contents();
+        }
+    }
+
+    // Initialize Virtual Memory manager starting at SD sector 4096
+    vmem_init(4096);
+
+    // Generate the 1,000,000 byte world onto the SD card
+    generate_massive_world();
+
+    // Camera animation parameters
+    float cam_t = 0.0f;
     uint32_t frame_count = 0;
     uint32_t sys_hz = clock_get_hz(clk_sys);
 
-    // Warm-up delay for USB CDC serial host connection
-    sleep_ms(1500);
-
-    const float cube_radius   = 0.22f; // Size of each individual cube
-    const float grid_spacing  = 0.70f; // Distance between cube centers
-    const float camera_dist   = 7.0f;  // Camera distance
-    const float fov           = 42.0f; // Perspective FOV
-
-    const int center_x = SCREEN_WIDTH / 2;
-    const int center_y = (SCREEN_HEIGHT / 2) - 1;
+    printf("\nStarting Real-time Paging Viewport Streamer...\n");
+    sleep_ms(1000);
 
     while (1) {
         uint64_t frame_start_us = time_us_64();
 
-        // 1. Clear frame and depth buffer
-        clear_buffers();
+        // 1. Calculate camera position (Smooth Lissajous path across the 1000x1000 world)
+        int cam_x = 500 + (int)(380.0f * sinf(cam_t * 0.4f)) - (VIEWPORT_WIDTH / 2);
+        int cam_y = 500 + (int)(380.0f * cosf(cam_t * 0.28f)) - (VIEWPORT_HEIGHT / 2);
 
-        // 2. Pre-calculate rotation trigonometric constants (RP2350 FPU)
-        float wcx = cosf(world_rx), wsx = sinf(world_rx);
-        float wcy = cosf(world_ry), wsy = sinf(world_ry);
-        float wcz = cosf(world_rz), wsz = sinf(world_rz);
+        if (cam_x < 0) cam_x = 0;
+        if (cam_x > VMEM_WIDTH - VIEWPORT_WIDTH) cam_x = VMEM_WIDTH - VIEWPORT_WIDTH;
+        if (cam_y < 0) cam_y = 0;
+        if (cam_y > VMEM_HEIGHT - VIEWPORT_HEIGHT) cam_y = VMEM_HEIGHT - VIEWPORT_HEIGHT;
 
-        float lcx = cosf(local_rx), lsx = sinf(local_rx);
-        float lcy = cosf(local_ry), lsy = sinf(local_ry);
-
-        uint64_t compute_start_us = time_us_64();
-
-        // 3. Transform & Project all 1,000 Vertices (125 Cubes x 8 Verts)
-        int vert_idx = 0;
-        for (int gx = -2; gx <= 2; gx++) {
-            for (int gy = -2; gy <= 2; gy++) {
-                for (int gz = -2; gz <= 2; gz++) {
-                    
-                    // Center position of this cube in the 3D grid
-                    float ox = (float)gx * grid_spacing;
-                    float oy = (float)gy * grid_spacing;
-                    float oz = (float)gz * grid_spacing;
-
-                    // Compute all 8 vertices for this cube
-                    for (int v = 0; v < VERTS_PER_CUBE; v++) {
-                        // A. Local Cube Rotation
-                        float lx = base_cube_verts[v].x * cube_radius;
-                        float ly = base_cube_verts[v].y * cube_radius;
-                        float lz = base_cube_verts[v].z * cube_radius;
-
-                        // Rotate local X
-                        float ly1 = ly * lcx - lz * lsx;
-                        float lz1 = ly * lsx + lz * lcx;
-                        float lx1 = lx;
-
-                        // Rotate local Y
-                        float lx2 = lx1 * lcy + lz1 * lsy;
-                        float ly2 = ly1;
-                        float lz2 = -lx1 * lsy + lz1 * lcy;
-
-                        // B. Offset to grid center
-                        float px_w = lx2 + ox;
-                        float py_w = ly2 + oy;
-                        float pz_w = lz2 + oz;
-
-                        // C. Global World Cluster Rotation
-                        // Rotate World X
-                        float wx1 = px_w;
-                        float wy1 = py_w * wcx - pz_w * wsx;
-                        float wz1 = py_w * wsx + pz_w * wcx;
-
-                        // Rotate World Y
-                        float wx2 = wx1 * wcy + wz1 * wsy;
-                        float wy2 = wy1;
-                        float wz2 = -wx1 * wsy + wz1 * wcy;
-
-                        // Rotate World Z
-                        float wx3 = wx2 * wcz - wy2 * wsz;
-                        float wy3 = wx2 * wsz + wy2 * wcz;
-                        float wz3 = wz2;
-
-                        // D. Perspective Projection & Depth Buffer Z
-                        float z_depth = wz3 + camera_dist;
-                        if (z_depth < 0.3f) z_depth = 0.3f;
-
-                        proj_x[vert_idx] = center_x + (int)((wx3 / z_depth) * fov * FONT_ASPECT);
-                        proj_y[vert_idx] = center_y - (int)((wy3 / z_depth) * fov);
-                        proj_z[vert_idx] = z_depth;
-
-                        vert_idx++;
-                    }
-                }
+        // 2. Stream pixels from Virtual Memory into terminal viewport
+        // This triggers Page-In / LRU Cache hits & misses dynamically!
+        for (int y = 0; y < VIEWPORT_HEIGHT; y++) {
+            for (int x = 0; x < VIEWPORT_WIDTH; x++) {
+                terminal_buf[y][x] = vmem_get_pixel(cam_x + x, cam_y + y);
             }
         }
 
-        // 4. Rasterize all 1,500 Edges with Z-Buffer
-        for (int c = 0; c < TOTAL_CUBES; c++) {
-            int base_v = c * VERTS_PER_CUBE;
-            for (int e = 0; e < EDGES_PER_CUBE; e++) {
-                int i0 = base_v + base_cube_edges[e].v0;
-                int i1 = base_v + base_cube_edges[e].v1;
-                draw_line_z(proj_x[i0], proj_y[i0], proj_z[i0],
-                            proj_x[i1], proj_y[i1], proj_z[i1]);
-            }
+        // 3. Overlay Viewport HUD & Telemetry
+        vmem_stats_t stats = vmem_get_stats();
+
+        // Top Banner
+        char hud_top[VIEWPORT_WIDTH + 1];
+        snprintf(hud_top, sizeof(hud_top), " [ PICO 2 OUT-OF-CORE VIRTUAL FRAMEBUFFER: 1.0 MB | RAM CACHE: 16 KB ] ");
+        int top_x = (VIEWPORT_WIDTH - (int)strlen(hud_top)) / 2;
+        for (int i = 0; hud_top[i] != '\0' && (top_x + i) < VIEWPORT_WIDTH - 1; i++) {
+            terminal_buf[0][top_x + i] = hud_top[i];
         }
 
-        uint64_t compute_end_us = time_us_64();
-        uint32_t compute_duration_us = (uint32_t)(compute_end_us - compute_start_us);
+        // Bottom Telemetry
+        char hud_bot[VIEWPORT_WIDTH + 1];
+        snprintf(hud_bot, sizeof(hud_bot), " POS:(%04d,%04d) | HIT:%.1f%% | SD-R:%lu SD-W:%lu | %luMHz ",
+                 cam_x, cam_y, stats.hit_ratio, 
+                 (unsigned long)stats.sd_reads, (unsigned long)stats.sd_writes,
+                 sys_hz / 1000000UL);
+        for (int i = 0; hud_bot[i] != '\0' && (2 + i) < VIEWPORT_WIDTH - 1; i++) {
+            terminal_buf[VIEWPORT_HEIGHT - 1][2 + i] = hud_bot[i];
+        }
 
-        // 5. Draw Decorative Border & Status Headers
-        draw_border();
-
-        char title[80];
-        snprintf(title, sizeof(title), " [ PICO 2 (RP2350) 125-CUBE 3D STRESS BENCHMARK ] ");
-        draw_string((SCREEN_WIDTH - (int)strlen(title)) / 2, 0, title);
-
-        char stats1[80];
-        snprintf(stats1, sizeof(stats1), "SYS: %lu MHz | CUBES: %d | VERTS: %d | EDGES: %d",
-                 sys_hz / 1000000UL, TOTAL_CUBES, TOTAL_VERTS, TOTAL_EDGES);
-        draw_string(3, 1, stats1);
-
-        char stats2[80];
-        uint32_t raw_fps = (compute_duration_us > 0) ? (1000000UL / compute_duration_us) : 9999;
-        snprintf(stats2, sizeof(stats2), "FPU CALC: %lu us (%.2f ms) | POTENTIAL: ~%lu FPS | Z-BUF: ON",
-                 (unsigned long)compute_duration_us, (float)compute_duration_us / 1000.0f, (unsigned long)raw_fps);
-        draw_string(3, SCREEN_HEIGHT - 2, stats2);
-
-        // 6. Build double-buffered ANSI output string
+        // 4. Build single ANSI frame
         int buf_pos = 0;
-        buf_pos += snprintf(output_buf + buf_pos, sizeof(output_buf) - buf_pos, 
-                            "\033[2J\033[H\033[1;36m"); // Cyan ANSI
+        buf_pos += snprintf(output_str + buf_pos, sizeof(output_str) - buf_pos,
+                            "\033[2J\033[H\033[1;32m"); // Green ANSI
 
-        for (int y = 0; y < SCREEN_HEIGHT; y++) {
-            for (int x = 0; x < SCREEN_WIDTH; x++) {
-                output_buf[buf_pos++] = frame_buf[y][x];
+        for (int y = 0; y < VIEWPORT_HEIGHT; y++) {
+            for (int x = 0; x < VIEWPORT_WIDTH; x++) {
+                output_str[buf_pos++] = terminal_buf[y][x];
             }
-            output_buf[buf_pos++] = '\r';
-            output_buf[buf_pos++] = '\n';
+            output_str[buf_pos++] = '\r';
+            output_str[buf_pos++] = '\n';
         }
-        buf_pos += snprintf(output_buf + buf_pos, sizeof(output_buf) - buf_pos, "\033[0m");
-        output_buf[buf_pos] = '\0';
+        buf_pos += snprintf(output_str + buf_pos, sizeof(output_str) - buf_pos, "\033[0m");
+        output_str[buf_pos] = '\0';
 
-        // 7. Transmit to USB CDC Serial
-        printf("%s", output_buf);
+        // 5. Send out over USB CDC Serial
+        printf("%s", output_str);
 
-        // 8. Increment Rotation Angles
-        world_ry += 0.045f;
-        world_rx += 0.025f;
-        world_rz += 0.015f;
-        local_rx += 0.060f;
-        local_ry += 0.080f;
-
-        if (world_rx > 6.28318f) world_rx -= 6.28318f;
-        if (world_ry > 6.28318f) world_ry -= 6.28318f;
-        if (world_rz > 6.28318f) world_rz -= 6.28318f;
-        if (local_rx > 6.28318f) local_rx -= 6.28318f;
-        if (local_ry > 6.28318f) local_ry -= 6.28318f;
-
+        // 6. Update Camera
+        cam_t += 0.04f;
         frame_count++;
 
-        // LED toggle every 10 frames
 #ifdef PICO_DEFAULT_LED_PIN
         if (frame_count % 10 == 0) {
             gpio_put(PICO_DEFAULT_LED_PIN, (frame_count / 10) % 2);
         }
 #endif
 
-        // 9. Frame interval limiter (~33 FPS / 30ms for smooth terminal display)
+        // 7. Frame rate limiter (~30 FPS / 33ms)
         uint64_t frame_end_us = time_us_64();
         uint64_t elapsed_us = frame_end_us - frame_start_us;
-        const uint64_t target_frame_us = 30000; // 30ms
+        const uint64_t target_frame_us = 33000;
 
         if (elapsed_us < target_frame_us) {
             sleep_us(target_frame_us - elapsed_us);

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 
-# Target Raspberry Pi Pico 2 (RP2350) by default
+# Target Raspberry Pi Pico 2 (RP2350)
 set(PICO_BOARD pico2 CACHE STRING "Board type")
 
 include(pico_sdk_import.cmake)
@@ -10,22 +10,25 @@ project(pico2_cube_demo C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-# Initialize the Raspberry Pi Pico SDK
+# Initialize Pico SDK
 pico_sdk_init()
 
 add_executable(pico2_cube_demo
     main.c
+    sd_spi.c
+    vmem_fb.c
 )
 
-# Pull in core SDK libraries, hardware drivers, and multicore
+# Pull in core SDK libraries and hardware SPI
 target_link_libraries(pico2_cube_demo
     pico_stdlib
-    pico_multicore
+    hardware_spi
     hardware_clocks
     hardware_gpio
+    pico_multicore
 )
 
-# Enable USB CDC stdio, disable hardware UART
+# Enable USB CDC stdio, disable UART
 pico_enable_stdio_usb(pico2_cube_demo 1)
 pico_enable_stdio_uart(pico2_cube_demo 0)
 
