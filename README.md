@@ -1,18 +1,19 @@
-# Pico 2 (RP2350) 3D ASCII Rotating Cube Demo
+# Pico 2 (RP2350) 125-Cube 3D ASCII Stress Benchmark
 
-Raspberry Pi Pico 2 (RP2350) mikrodenetleyicisi için USB CDC seri portu üzerinden terminale gerçek zamanlı 3D döner küp render eden bağımsız demo projesi.
+Raspberry Pi Pico 2 (RP2350) mikrodenetleyicisi için USB CDC seri portu üzerinden terminale gerçek zamanlı **125 eşzamanlı 3D küp** (5x5x5 Matris) render eden, Z-Buffer derinlik tamponlu donanım stres testi ve benchmark projesi.
 
 ## Özellikler
 
 - **Donanım:** Raspberry Pi Pico 2 (RP2350, ARM Cortex-M33 @ 150 MHz, Donanımsal FPU)
-- **Sıfır Dış Bağımlılık:** SD kart veya harici dosya sistemi gerektirmez, yalnızca temel Pico SDK kullanılır.
-- **İletişim:** USB CDC (`stdio_usb`) üzerinden 115200 baud seri haberleşme.
-- **3D Render:**
-  - 3 eksenli (Pitch, Yaw, Roll) gerçek zamanlı trigonometrik rotasyon.
-  - Bresenham çizgi algoritması ile ASCII tel kafes (wireframe) çizimi.
-  - ANSI escape kodları (`\033[2J\033[H`) ile çift tamponlu, titreşimsiz çıktı.
-  - ~20 FPS (50 ms) kararlı kare hızı.
-- **Dahili Telemetri:** Çalışma süresi, kare sayısı, saat frekansı ve LED kalp atışı (heartbeat).
+- **125 Eşzamanlı Küp:** 5×5×5 kübik uzaysal matris.
+- **1.000 Köşe (Vertex) & 1.500 Kenar (Edge):** Her karede donanımsal FPU ile trigonometrik dönüşüm ve Bresenham çizgi rasterizasyonu.
+- **ASCII Z-Buffer (Derinlik Tamponu):** Üst üste binen kenarları derinliğe göre sıralar, mesafeye bağlı ASCII karakter yoğunluğu (`@`, `#`, `*`, `+`, `:`, `.`) ile 3D hacim hissi verir.
+- **Canlı Mikro-saniye Telemetrisi:**
+  - Anlık saf FPU hesaplama süresi ($\mu s$ ve $ms$)
+  - Teorik Maksimum Donanım Render Kapasitesi (~FPS)
+  - 150 MHz sistem frekansı ve çalışma süresi
+- **İletişim:** USB CDC (`stdio_usb`) üzerinden ANSI çift tamponlu, titreşimsiz çıktı.
+- **Sıfır Harici Bağımlılık:** SD kart veya harici kütüphane gerektirmez.
 
 ## Proje Yapısı
 
@@ -36,13 +37,13 @@ cmake -DPICO_BOARD=pico2 ..
 make -j$(nproc)
 ```
 
-Derleme sonucunda `build/pico2_cube_demo.uf2` dosyası üretilir.
+Derleme çıktısı: `build/pico2_cube_demo.uf2`
 
 ## Yükleme ve Çalıştırma
 
 1. Pico 2 üzerindeki **BOOTSEL** butonuna basılı tutarak kartı USB ile bilgisayara bağlayın.
-2. Oluşan `RPI-RP2` sürücüsüne `pico2_cube_demo.uf2` dosyasını kopyalayın.
-3. Terminal üzerinden seri porta bağlanın:
+2. Açılan `RPI-RP2` sürücüsüne `pico2_cube_demo.uf2` dosyasını kopyalayın.
+3. Terminal üzerinden seri porta bağlanın (Terminal boyutunuzu en az **80x35** yapmanız önerilir):
 
 ```bash
 # Minicom ile:

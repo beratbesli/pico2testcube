@@ -17,9 +17,10 @@ add_executable(pico2_cube_demo
     main.c
 )
 
-# Pull in core SDK libraries and hardware drivers
+# Pull in core SDK libraries, hardware drivers, and multicore
 target_link_libraries(pico2_cube_demo
     pico_stdlib
+    pico_multicore
     hardware_clocks
     hardware_gpio
 )
