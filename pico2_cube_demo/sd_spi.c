@@ -31,7 +31,7 @@ static inline uint8_t sd_spi_transfer_byte(uint8_t tx) {
     return rx;
 }
 
-// Select SD Card (CS = LOW) and send 1 dummy clock byte (Elm-ChaN / SD Spec standard)
+// Select SD Card (CS = LOW) and send 1 dummy clock byte
 static inline void sd_cs_select(void) {
     gpio_put(SD_PIN_CS, 0);
     sd_spi_transfer_byte(0xFF);
@@ -57,13 +57,6 @@ static bool sd_wait_ready(uint32_t timeout_ms) {
 
 /**
  * Send a standard 6-byte SD SPI command packet while CS is ALREADY asserted LOW.
- * Packet structure:
- *  Byte 0: 0x40 | (cmd & 0x3F)
- *  Byte 1: (arg >> 24) & 0xFF  [Big-Endian]
- *  Byte 2: (arg >> 16) & 0xFF
- *  Byte 3: (arg >> 8)  & 0xFF
- *  Byte 4: (arg >> 0)  & 0xFF
- *  Byte 5: CRC7 << 1 | 0x01
  */
 static uint8_t sd_cmd_spi_raw(uint8_t cmd, uint32_t arg) {
     uint8_t packet[6];
@@ -122,8 +115,7 @@ static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg) {
 
 /**
  * Send an Application Command (ACMD) with ATOMIC CS framing:
- * CS is pulled LOW once, CMD55 is sent, response read,
- * followed immediately by the ACMD command without de-asserting CS in between.
+ * CS remains LOW across CMD55 and ACMD.
  */
 static uint8_t sd_send_acmd(uint8_t acmd, uint32_t arg, uint8_t *out_cmd55_r1) {
     sd_cs_select();
@@ -405,15 +397,22 @@ bool sd_write_sector(uint32_t sector_lba, const uint8_t *buffer) {
     sd_spi_transfer_byte(0xFF);
     sd_spi_transfer_byte(0xFF);
 
-    // Read Data Response Token
-    uint8_t resp = sd_spi_transfer_byte(0xFF);
+    // Read Data Response Token (card sends 0 to 64 bytes before response token xxx00101b)
+    uint8_t resp = 0xFF;
+    for (int i = 0; i < 64; i++) {
+        resp = sd_spi_transfer_byte(0xFF);
+        if ((resp & 0x11) == 0x01) { // Data response token format: xxx00101b
+            break;
+        }
+    }
+
     if ((resp & 0x1F) != 0x05) { // 0x05 = Data accepted
         sd_cs_deselect();
         return false;
     }
 
     // Wait while card writes block (busy state: MISO held LOW)
-    if (!sd_wait_ready(350)) { // 350ms timeout
+    if (!sd_wait_ready(400)) { // 400ms timeout
         sd_cs_deselect();
         return false;
     }

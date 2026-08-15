@@ -13,7 +13,6 @@
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
-#include "hardware/watchdog.h"
 #include "sd_spi.h"
 #include "vmem_fb.h"
 
@@ -23,20 +22,6 @@
 // Statically allocated in BSS (not on stack)
 static char terminal_buf[VIEWPORT_HEIGHT][VIEWPORT_WIDTH];
 static char output_str[16384];
-
-// Custom Hard Fault Handler to trap any crash and prevent silent hardware resets
-void isr_hardfault(void) {
-#ifdef PICO_DEFAULT_LED_PIN
-    gpio_put(PICO_DEFAULT_LED_PIN, 1);
-#endif
-    printf("\n\n======================================================\n");
-    printf("   [CRITICAL] HARD FAULT / CRASH DETECTED ON PICO 2!\n");
-    printf("   System execution halted to preserve crash state.\n");
-    printf("======================================================\n\n");
-    while (1) {
-        tight_loop_contents();
-    }
-}
 
 // Draw a 3D wireframe cube directly into the Virtual Memory space
 static void vmem_render_3d_cube(int center_x, int center_y, float size, float rx, float ry, float rz, char ch) {
@@ -139,17 +124,25 @@ static void generate_massive_world(void) {
 }
 
 int main(void) {
-    // Disable any hardware watchdog that might have been left running
-    watchdog_reboot(0, 0, 0); // No reboot
-
-    stdio_init_all();
-
+    // 1. Guaranteed Immediate Power-On Heartbeat on GPIO 25 (Pico 2 Onboard LED)
 #ifdef PICO_DEFAULT_LED_PIN
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-    gpio_put(PICO_DEFAULT_LED_PIN, 1);
+
+    // Quick 3-blink sequence to visually confirm code execution immediately on boot
+    for (int i = 0; i < 3; i++) {
+        gpio_put(PICO_DEFAULT_LED_PIN, 1);
+        sleep_ms(100);
+        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        sleep_ms(100);
+    }
+    gpio_put(PICO_DEFAULT_LED_PIN, 1); // Solid ON
 #endif
 
+    // 2. Initialize stdio (USB CDC)
+    stdio_init_all();
+
+    // Warm-up delay for USB CDC host serial enumeration
     sleep_ms(2000);
 
     printf("\n======================================================\n");
@@ -157,24 +150,34 @@ int main(void) {
     printf("  SPI0 Pinout: MISO=GP16, CS=GP17, SCK=GP18, MOSI=GP19\n");
     printf("======================================================\n\n");
 
-    // Initialize SD card on SPI0
+    // 3. Initialize SD card on SPI0
     bool sd_ok = sd_spi_init();
     if (!sd_ok) {
         printf("\n[ERROR] MicroSD card initialization failed on SPI0!\n");
-        printf("Please verify:\n");
+        printf("Please verify hardware wiring:\n");
         printf("  - MISO -> GP16\n  - CS   -> GP17\n  - SCK  -> GP18\n  - MOSI -> GP19\n  - VCC  -> 3V3(OUT)\n");
+        
+        // Keep serial alive and blink LED slowly (500ms) to indicate SD error state
         while (1) {
-            tight_loop_contents();
+#ifdef PICO_DEFAULT_LED_PIN
+            gpio_put(PICO_DEFAULT_LED_PIN, 0);
+            sleep_ms(500);
+            gpio_put(PICO_DEFAULT_LED_PIN, 1);
+            sleep_ms(500);
+#else
+            sleep_ms(1000);
+#endif
+            printf("[SD_WAIT] Waiting for valid MicroSD on SPI0...\n");
         }
     }
 
-    // Initialize Virtual Memory manager starting at SD sector 4096
+    // 4. Initialize Virtual Memory manager starting at SD sector 4096
     vmem_init(4096);
 
-    // Generate the 1,000,000 byte world onto the SD card
+    // 5. Generate the 1,000,000 byte world onto the SD card
     generate_massive_world();
 
-    // Camera animation parameters
+    // 6. Camera animation parameters
     float cam_t = 0.0f;
     uint32_t frame_count = 0;
     uint32_t sys_hz = clock_get_hz(clk_sys);
@@ -185,7 +188,7 @@ int main(void) {
     while (1) {
         uint64_t frame_start_us = time_us_64();
 
-        // 1. Calculate camera position (Smooth Lissajous path across the 1000x1000 world)
+        // A. Calculate camera position (Smooth Lissajous path across the 1000x1000 world)
         int cam_x = 500 + (int)(380.0f * sinf(cam_t * 0.4f)) - (VIEWPORT_WIDTH / 2);
         int cam_y = 500 + (int)(380.0f * cosf(cam_t * 0.28f)) - (VIEWPORT_HEIGHT / 2);
 
@@ -194,7 +197,7 @@ int main(void) {
         if (cam_y < 0) cam_y = 0;
         if (cam_y > VMEM_HEIGHT - VIEWPORT_HEIGHT) cam_y = VMEM_HEIGHT - VIEWPORT_HEIGHT;
 
-        // 2. Stream pixels from Virtual Memory into terminal viewport
+        // B. Stream pixels from Virtual Memory into terminal viewport
         // This triggers Page-In / LRU Cache hits & misses dynamically!
         for (int y = 0; y < VIEWPORT_HEIGHT; y++) {
             for (int x = 0; x < VIEWPORT_WIDTH; x++) {
@@ -202,7 +205,7 @@ int main(void) {
             }
         }
 
-        // 3. Overlay Viewport HUD & Telemetry
+        // C. Overlay Viewport HUD & Telemetry
         vmem_stats_t stats = vmem_get_stats();
 
         // Top Banner
@@ -223,7 +226,7 @@ int main(void) {
             terminal_buf[VIEWPORT_HEIGHT - 1][2 + i] = hud_bot[i];
         }
 
-        // 4. Build single ANSI frame
+        // D. Build single ANSI frame
         int buf_pos = 0;
         buf_pos += snprintf(output_str + buf_pos, sizeof(output_str) - buf_pos,
                             "\033[2J\033[H\033[1;32m"); // Green ANSI
@@ -238,10 +241,10 @@ int main(void) {
         buf_pos += snprintf(output_str + buf_pos, sizeof(output_str) - buf_pos, "\033[0m");
         output_str[buf_pos] = '\0';
 
-        // 5. Send out over USB CDC Serial
+        // E. Send out over USB CDC Serial
         printf("%s", output_str);
 
-        // 6. Update Camera
+        // F. Update Camera
         cam_t += 0.04f;
         frame_count++;
 
@@ -251,7 +254,7 @@ int main(void) {
         }
 #endif
 
-        // 7. Frame rate limiter (~30 FPS / 33ms)
+        // G. Frame rate limiter (~30 FPS / 33ms)
         uint64_t frame_end_us = time_us_64();
         uint64_t elapsed_us = frame_end_us - frame_start_us;
         const uint64_t target_frame_us = 33000;
