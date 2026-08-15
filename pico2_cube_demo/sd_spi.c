@@ -6,16 +6,16 @@
 #define SD_INIT_BAUD         100000    // 100 kHz for initial handshake (<= 400 kHz standard)
 #define SD_FAST_BAUD         20000000  // 20 MHz high-speed SPI (after successful init)
 
-// SD SPI Commands (Command index with start bit 0x40)
-#define CMD0_GO_IDLE_STATE           0x40  // arg: 0x00000000, crc: 0x95
-#define CMD1_SEND_OP_COND            0x41  // arg: 0x00000000, crc: 0xF9 (MMC fallback)
-#define CMD8_SEND_IF_COND            0x48  // arg: 0x000001AA, crc: 0x87
-#define CMD16_SET_BLOCKLEN           0x50  // arg: 0x00000200 (512), crc: 0xFF
-#define CMD17_READ_SINGLE_BLOCK      0x51
-#define CMD24_WRITE_SINGLE_BLOCK     0x58
-#define CMD55_APP_CMD                0x77  // arg: 0x00000000, crc: 0x65
-#define CMD58_READ_OCR               0x7A  // arg: 0x00000000, crc: 0xFD
-#define ACMD41_SD_SEND_OP_COND       0x69  // arg: 0x40000000 (HCS=1) or 0x00000000 (HCS=0)
+// Standard SD/MMC Command Numbers
+#define CMD0_GO_IDLE_STATE           0
+#define CMD1_SEND_OP_COND            1
+#define CMD8_SEND_IF_COND            8
+#define CMD16_SET_BLOCKLEN           16
+#define CMD17_READ_SINGLE_BLOCK      17
+#define CMD24_WRITE_SINGLE_BLOCK     24
+#define CMD55_APP_CMD                55
+#define CMD58_READ_OCR               58
+#define ACMD41_SD_SEND_OP_COND       41
 
 static sd_card_info_t g_card_info = {
     .initialized = false,
@@ -24,25 +24,23 @@ static sd_card_info_t g_card_info = {
     .spi_baudrate = SD_INIT_BAUD
 };
 
-// Select SD Card (CS = LOW)
-static inline void sd_cs_select(void) {
-    gpio_put(SD_PIN_CS, 0);
-    sleep_us(5);
-}
-
-// Deselect SD Card (CS = HIGH) and provide 8 clock cycles for card cleanup
-static inline void sd_cs_deselect(void) {
-    gpio_put(SD_PIN_CS, 1);
-    sleep_us(5);
-    uint8_t dummy = 0xFF;
-    spi_write_blocking(SD_SPI_PORT, &dummy, 1);
-}
-
 // Single-byte full-duplex transfer over SPI
 static inline uint8_t sd_spi_transfer_byte(uint8_t tx) {
     uint8_t rx = 0xFF;
     spi_write_read_blocking(SD_SPI_PORT, &tx, &rx, 1);
     return rx;
+}
+
+// Select SD Card (CS = LOW) and send 1 dummy clock byte (Elm-ChaN / SD Spec standard)
+static inline void sd_cs_select(void) {
+    gpio_put(SD_PIN_CS, 0);
+    sd_spi_transfer_byte(0xFF);
+}
+
+// Deselect SD Card (CS = HIGH) and send 1 dummy clock byte for card cleanup
+static inline void sd_cs_deselect(void) {
+    gpio_put(SD_PIN_CS, 1);
+    sd_spi_transfer_byte(0xFF);
 }
 
 // Wait until SD card releases MISO line (returns 0xFF when ready)
@@ -57,61 +55,92 @@ static bool sd_wait_ready(uint32_t timeout_ms) {
     return false;
 }
 
-// Send a raw 6-byte SPI command packet and wait for R1 response
-static uint8_t sd_send_command_raw(uint8_t cmd, uint32_t arg, uint8_t crc) {
+/**
+ * Send a standard 6-byte SD SPI command packet while CS is ALREADY asserted LOW.
+ * Packet structure:
+ *  Byte 0: 0x40 | (cmd & 0x3F)
+ *  Byte 1: (arg >> 24) & 0xFF  [Big-Endian]
+ *  Byte 2: (arg >> 16) & 0xFF
+ *  Byte 3: (arg >> 8)  & 0xFF
+ *  Byte 4: (arg >> 0)  & 0xFF
+ *  Byte 5: CRC7 << 1 | 0x01
+ */
+static uint8_t sd_cmd_spi_raw(uint8_t cmd, uint32_t arg) {
     uint8_t packet[6];
-    packet[0] = cmd;
+    packet[0] = 0x40 | (cmd & 0x3F);
     packet[1] = (uint8_t)(arg >> 24);
     packet[2] = (uint8_t)(arg >> 16);
     packet[3] = (uint8_t)(arg >> 8);
-    packet[4] = (uint8_t)(arg);
-    packet[5] = crc;
+    packet[4] = (uint8_t)(arg >> 0);
 
-    // Wait for card ready before transmitting
-    sd_wait_ready(200);
+    // CRC7 calculation / standard precomputed CRCs
+    switch (cmd) {
+        case CMD0_GO_IDLE_STATE:
+            packet[5] = 0x95; // Valid CRC for CMD0(0)
+            break;
+        case CMD8_SEND_IF_COND:
+            packet[5] = 0x87; // Valid CRC for CMD8(0x1AA)
+            break;
+        case CMD55_APP_CMD:
+            packet[5] = 0x65; // Valid CRC for CMD55(0)
+            break;
+        default:
+            packet[5] = 0xFF; // Bit 0 must be 1 (Stop Bit)
+            break;
+    }
+
+    // Wait for card ready before transmitting (except CMD0)
+    if (cmd != CMD0_GO_IDLE_STATE) {
+        sd_wait_ready(200);
+    }
 
     // Transmit 6-byte command packet
     spi_write_blocking(SD_SPI_PORT, packet, 6);
 
-    // Wait for response token (MSB must be 0 for valid R1)
-    // Timeout up to 64 bytes
-    for (int i = 0; i < 64; i++) {
-        uint8_t res = sd_spi_transfer_byte(0xFF);
-        if ((res & 0x80) == 0) {
-            return res;
+    // Loop for response: NCR is 0 to 8 bytes for SD cards (we check up to 32 bytes)
+    uint8_t response = 0xFF;
+    for (int i = 0; i < 32; i++) {
+        response = sd_spi_transfer_byte(0xFF);
+        // Valid R1 response received (MSB is 0)
+        if ((response & 0x80) == 0) {
+            break;
         }
     }
-    return 0xFF; // Timeout
+
+    return response;
 }
 
-// Send standard command with automatic CS framing
-static uint8_t sd_send_command(uint8_t cmd, uint32_t arg, uint8_t crc) {
+/**
+ * Send a standalone command with automatic CS framing.
+ */
+static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg) {
     sd_cs_select();
-    uint8_t r1 = sd_send_command_raw(cmd, arg, crc);
+    uint8_t r1 = sd_cmd_spi_raw(cmd, arg);
     sd_cs_deselect();
     return r1;
 }
 
-// Send ACMD (CMD55 followed immediately by ACMD<n>) with proper CS framing
-static uint8_t sd_send_acmd(uint8_t acmd, uint32_t arg, uint8_t crc, uint8_t *out_cmd55_r1) {
-    // 1. Send CMD55 (APP_CMD)
+/**
+ * Send an Application Command (ACMD) with ATOMIC CS framing:
+ * CS is pulled LOW once, CMD55 is sent, response read,
+ * followed immediately by the ACMD command without de-asserting CS in between.
+ */
+static uint8_t sd_send_acmd(uint8_t acmd, uint32_t arg, uint8_t *out_cmd55_r1) {
     sd_cs_select();
-    uint8_t r1_55 = sd_send_command_raw(CMD55_APP_CMD, 0, 0x65);
-    sd_cs_deselect();
 
+    // 1. Send CMD55 (APP_CMD)
+    uint8_t r1_55 = sd_cmd_spi_raw(CMD55_APP_CMD, 0x00000000);
     if (out_cmd55_r1) {
         *out_cmd55_r1 = r1_55;
     }
 
-    if (r1_55 > 0x01) {
-        return r1_55; // CMD55 rejected
-    }
+    // Wait for card ready between CMD55 and ACMD
+    sd_wait_ready(100);
 
-    // 2. Send ACMD (e.g. ACMD41)
-    sd_cs_select();
-    uint8_t r1_acmd = sd_send_command_raw(acmd, arg, crc);
+    // 2. Send ACMD (e.g. ACMD41) while CS remains LOW
+    uint8_t r1_acmd = sd_cmd_spi_raw(acmd, arg);
+
     sd_cs_deselect();
-
     return r1_acmd;
 }
 
@@ -119,7 +148,7 @@ bool sd_spi_init(void) {
     memset(&g_card_info, 0, sizeof(g_card_info));
     g_card_info.type = SD_TYPE_UNKNOWN;
 
-    printf("[SD] --- Starting MicroSD Card Initialization ---\n");
+    printf("\n[SD] === Starting MicroSD Card SPI Initialization ===\n");
 
     // 1. Initialize GPIO pins for SPI0
     gpio_set_function(SD_PIN_MISO, GPIO_FUNC_SPI);
@@ -134,9 +163,9 @@ bool sd_spi_init(void) {
     // 2. Initialize SPI at low frequency (100 kHz)
     uint actual_baud = spi_init(SD_SPI_PORT, SD_INIT_BAUD);
     spi_set_format(SD_SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-    printf("[SD] Hardware SPI0 initialized at %u Hz (<= 400 kHz mode)\n", actual_baud);
+    printf("[SD] SPI0 initialized at %u Hz (<= 400 kHz mode)\n", actual_baud);
 
-    // 3. Power-Up Settling Delay (At least 250ms for card internal POR)
+    // 3. Power-Up Settling Delay (300ms)
     printf("[SD] Power settling delay (300ms)...\n");
     sleep_ms(300);
 
@@ -148,10 +177,10 @@ bool sd_spi_init(void) {
     sleep_ms(5);
 
     // 5. Enter SPI Mode: CMD0 (GO_IDLE_STATE)
-    printf("[SD] Sending CMD0 (Reset to SPI Mode)...\n");
+    printf("[SD] Sending CMD0 (Reset to SPI mode)...\n");
     uint8_t r1 = 0xFF;
     for (int attempt = 1; attempt <= 30; attempt++) {
-        r1 = sd_send_command(CMD0_GO_IDLE_STATE, 0, 0x95);
+        r1 = sd_send_cmd(CMD0_GO_IDLE_STATE, 0x00000000);
         if (r1 == 0x01) {
             printf("[SD] CMD0 Success on attempt %d! R1: 0x01 (In Idle State)\n", attempt);
             break;
@@ -160,69 +189,68 @@ bool sd_spi_init(void) {
     }
 
     if (r1 != 0x01) {
-        printf("[SD] ERROR: CMD0 failed after 30 attempts! Last R1: 0x%02X\n", r1);
+        printf("[SD] ERROR: CMD0 failed! Last R1: 0x%02X\n", r1);
         return false;
     }
 
-    // 6. Check Interface Condition: CMD8 (Voltage 2.7-3.6V, Check Pattern 0xAA)
+    // 6. Check Interface Condition: CMD8 (Voltage 2.7-3.6V, Pattern 0xAA)
     printf("[SD] Sending CMD8 (Check Voltage & Spec Version)...\n");
     sd_cs_select();
-    r1 = sd_send_command_raw(CMD8_SEND_IF_COND, 0x000001AA, 0x87);
+    r1 = sd_cmd_spi_raw(CMD8_SEND_IF_COND, 0x000001AA);
     bool is_v2 = false;
 
     if (r1 == 0x01) {
         uint8_t r7[4];
         for (int i = 0; i < 4; i++) r7[i] = sd_spi_transfer_byte(0xFF);
-        printf("[SD] CMD8 Response: 0x01 | R7: %02X %02X %02X %02X\n", r7[0], r7[1], r7[2], r7[3]);
+        printf("[SD] CMD8 Success! R1=0x01 | R7: %02X %02X %02X %02X\n", r7[0], r7[1], r7[2], r7[3]);
         if (r7[3] == 0xAA) {
             is_v2 = true;
-            printf("[SD] Card conforms to SD Spec v2.0+ (Pattern 0xAA matched)\n");
+            printf("[SD] Card conforms to SD Spec v2.0+ (Check pattern matched)\n");
         }
     } else {
         printf("[SD] CMD8 returned 0x%02X -> Card is SD v1.x or MMC\n", r1);
     }
     sd_cs_deselect();
 
-    // 7. Initialize Card: ACMD41 Retry Loop
-    // For SDSC cards (<= 2GB), HCS=0 (0x00000000) or HCS=1 (0x40000000) is used.
-    // We start with HCS=1 if v2; if it stays idle, we dynamically try HCS=0.
-    printf("[SD] Starting ACMD41 Initialization Loop (Timeout: 2500ms)...\n");
+    // 7. Read OCR Register via CMD58 (Pre-initialization check)
+    printf("[SD] Reading OCR via CMD58...\n");
+    sd_cs_select();
+    r1 = sd_cmd_spi_raw(CMD58_READ_OCR, 0x00000000);
+    if (r1 == 0x01 || r1 == 0x00) {
+        uint8_t ocr[4];
+        for (int i = 0; i < 4; i++) ocr[i] = sd_spi_transfer_byte(0xFF);
+        printf("[SD] Pre-init OCR: %02X %02X %02X %02X (3.3V Voltage Window OK)\n",
+               ocr[0], ocr[1], ocr[2], ocr[3]);
+    }
+    sd_cs_deselect();
+
+    // 8. Initialize Card: ACMD41 Loop with Atomic CS Framing
+    printf("[SD] Starting ACMD41 Initialization Loop (Atomic CS framing)...\n");
     uint32_t hcs_arg = is_v2 ? 0x40000000UL : 0x00000000UL;
-    uint8_t  hcs_crc = (hcs_arg != 0) ? 0x77 : 0xE5;
 
     uint64_t start_time = time_us_64();
     bool ready = false;
     int attempt_count = 0;
     uint8_t last_cmd55_r1 = 0xFF;
     uint8_t last_acmd41_r1 = 0xFF;
-    bool switched_to_sdsc_hcs0 = false;
 
     while ((time_us_64() - start_time) < 2500000ULL) { // 2.5 second timeout
         attempt_count++;
 
-        // After 100 attempts (~500ms) with HCS=1, if card is still in Idle (0x01),
-        // fallback to HCS=0 (Standard Capacity SDSC mode)
-        if (attempt_count > 80 && is_v2 && !switched_to_sdsc_hcs0 && last_acmd41_r1 == 0x01) {
-            printf("[SD] Card still idle with HCS=1. Switching ACMD41 to SDSC mode (HCS=0)...\n");
-            hcs_arg = 0x00000000UL;
-            hcs_crc = 0xE5;
-            switched_to_sdsc_hcs0 = true;
-        }
+        // Send atomic CMD55 + ACMD41
+        last_acmd41_r1 = sd_send_acmd(ACMD41_SD_SEND_OP_COND, hcs_arg, &last_cmd55_r1);
 
-        // Send CMD55 + ACMD41 pair
-        last_acmd41_r1 = sd_send_acmd(ACMD41_SD_SEND_OP_COND, hcs_arg, hcs_crc, &last_cmd55_r1);
-
-        // Log progress periodically or on key events
-        if (attempt_count == 1 || (attempt_count % 50 == 0)) {
+        // Periodically log progress or log when R1 changes
+        if (attempt_count == 1 || (attempt_count % 50 == 0) || last_acmd41_r1 == 0x00) {
             uint32_t elapsed_ms = (uint32_t)((time_us_64() - start_time) / 1000ULL);
-            printf("[SD] Attempt #%d (%u ms) -> CMD55 R1: 0x%02X | ACMD41 R1: 0x%02X (HCS=0x%08lX)\n",
-                   attempt_count, elapsed_ms, last_cmd55_r1, last_acmd41_r1, (unsigned long)hcs_arg);
+            printf("[SD] Attempt #%d (%u ms) -> CMD55 R1: 0x%02X | ACMD41 R1: 0x%02X\n",
+                   attempt_count, elapsed_ms, last_cmd55_r1, last_acmd41_r1);
         }
 
         // R1 == 0x00 means card has left idle state and is ready!
         if (last_acmd41_r1 == 0x00) {
             uint32_t elapsed_ms = (uint32_t)((time_us_64() - start_time) / 1000ULL);
-            printf("[SD] ACMD41 SUCCESS on attempt #%d (took %u ms)! Card is READY (R1: 0x00)\n", 
+            printf("[SD] *** ACMD41 SUCCESS on attempt #%d (took %u ms)! Card is READY (R1: 0x00) ***\n", 
                    attempt_count, elapsed_ms);
             ready = true;
             break;
@@ -231,11 +259,29 @@ bool sd_spi_init(void) {
         sleep_ms(5); // Paced retry delay
     }
 
-    // Fallback: If ACMD41 failed, try legacy CMD1 (MMC / older SD cards)
+    // Fallback: If ACMD41 failed with HCS=1, retry with HCS=0 (Standard Capacity SDSC)
+    if (!ready && is_v2) {
+        printf("[SD] ACMD41 timed out with HCS=1. Retrying ACMD41 with HCS=0 (SDSC mode)...\n");
+        hcs_arg = 0x00000000UL;
+        start_time = time_us_64();
+
+        while ((time_us_64() - start_time) < 2000000ULL) {
+            attempt_count++;
+            last_acmd41_r1 = sd_send_acmd(ACMD41_SD_SEND_OP_COND, hcs_arg, &last_cmd55_r1);
+            if (last_acmd41_r1 == 0x00) {
+                printf("[SD] ACMD41 SUCCESS with HCS=0 on attempt #%d! Card is READY\n", attempt_count);
+                ready = true;
+                break;
+            }
+            sleep_ms(5);
+        }
+    }
+
+    // Fallback: Try legacy CMD1 (MMC / older SD cards)
     if (!ready) {
-        printf("[SD] ACMD41 timed out. Trying legacy CMD1 fallback...\n");
+        printf("[SD] Retrying with legacy CMD1 fallback...\n");
         for (int cmd1_attempt = 1; cmd1_attempt <= 100; cmd1_attempt++) {
-            last_acmd41_r1 = sd_send_command(CMD1_SEND_OP_COND, 0, 0xF9);
+            last_acmd41_r1 = sd_send_cmd(CMD1_SEND_OP_COND, 0x00000000);
             if (last_acmd41_r1 == 0x00) {
                 printf("[SD] Legacy CMD1 SUCCESS on attempt #%d!\n", cmd1_attempt);
                 ready = true;
@@ -247,19 +293,19 @@ bool sd_spi_init(void) {
 
     if (!ready) {
         uint32_t total_time_ms = (uint32_t)((time_us_64() - start_time) / 1000ULL);
-        printf("[SD] ERROR: ACMD41 timeout after %d attempts, total time: %u ms (CMD55: 0x%02X, ACMD41: 0x%02X)\n",
+        printf("[SD] ERROR: Card initialization timeout after %d attempts, total time: %u ms (CMD55: 0x%02X, ACMD41: 0x%02X)\n",
                attempt_count, total_time_ms, last_cmd55_r1, last_acmd41_r1);
         return false;
     }
 
-    // 8. Determine Card Type (SDSC vs SDHC via CMD58 Read OCR)
+    // 9. Determine Card Type (SDSC vs SDHC via CMD58 Read OCR)
     if (is_v2) {
         sd_cs_select();
-        r1 = sd_send_command_raw(CMD58_READ_OCR, 0, 0xFD);
+        r1 = sd_cmd_spi_raw(CMD58_READ_OCR, 0x00000000);
         if (r1 == 0x00) {
             uint8_t ocr[4];
             for (int i = 0; i < 4; i++) ocr[i] = sd_spi_transfer_byte(0xFF);
-            printf("[SD] OCR Register: %02X %02X %02X %02X\n", ocr[0], ocr[1], ocr[2], ocr[3]);
+            printf("[SD] Post-init OCR: %02X %02X %02X %02X\n", ocr[0], ocr[1], ocr[2], ocr[3]);
             // Bit 30 (CCS bit) indicates Block vs Byte addressing
             if (ocr[0] & 0x40) {
                 g_card_info.type = SD_TYPE_SDHC;
@@ -275,10 +321,10 @@ bool sd_spi_init(void) {
         printf("[SD] Card Type: SDSC v1.x (Byte-Addressed, <=2GB)\n");
     }
 
-    // 9. For SDSC: Explicitly set block length to 512 bytes (CMD16)
+    // 10. For SDSC: Explicitly set block length to 512 bytes (CMD16)
     if (g_card_info.type != SD_TYPE_SDHC) {
         printf("[SD] Setting Block Length to 512 bytes (CMD16)...\n");
-        r1 = sd_send_command(CMD16_SET_BLOCKLEN, SD_SECTOR_SIZE, 0xFF);
+        r1 = sd_send_cmd(CMD16_SET_BLOCKLEN, SD_SECTOR_SIZE);
         if (r1 != 0x00) {
             printf("[SD] WARNING: CMD16 SET_BLOCKLEN returned 0x%02X\n", r1);
         } else {
@@ -286,12 +332,12 @@ bool sd_spi_init(void) {
         }
     }
 
-    // 10. Switch SPI to High-Speed (20 MHz) ONLY after full initialization
+    // 11. Switch SPI to High-Speed (20 MHz) ONLY after full initialization
     uint fast_baud = spi_set_baudrate(SD_SPI_PORT, SD_FAST_BAUD);
     g_card_info.spi_baudrate = fast_baud;
     g_card_info.initialized = true;
 
-    printf("[SD] *** Initialization Complete! Switching to High-Speed SPI: %u MHz ***\n\n",
+    printf("[SD] *** Initialization Complete! High-Speed SPI: %u MHz ***\n\n",
            g_card_info.spi_baudrate / 1000000);
 
     return true;
@@ -304,7 +350,7 @@ bool sd_read_sector(uint32_t sector_lba, uint8_t *buffer) {
     uint32_t addr = (g_card_info.type == SD_TYPE_SDHC) ? sector_lba : (sector_lba * SD_SECTOR_SIZE);
 
     sd_cs_select();
-    uint8_t r1 = sd_send_command_raw(CMD17_READ_SINGLE_BLOCK, addr, 0xFF);
+    uint8_t r1 = sd_cmd_spi_raw(CMD17_READ_SINGLE_BLOCK, addr);
     if (r1 != 0x00) {
         sd_cs_deselect();
         return false;
@@ -342,7 +388,7 @@ bool sd_write_sector(uint32_t sector_lba, const uint8_t *buffer) {
     uint32_t addr = (g_card_info.type == SD_TYPE_SDHC) ? sector_lba : (sector_lba * SD_SECTOR_SIZE);
 
     sd_cs_select();
-    uint8_t r1 = sd_send_command_raw(CMD24_WRITE_SINGLE_BLOCK, addr, 0xFF);
+    uint8_t r1 = sd_cmd_spi_raw(CMD24_WRITE_SINGLE_BLOCK, addr);
     if (r1 != 0x00) {
         sd_cs_deselect();
         return false;
