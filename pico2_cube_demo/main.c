@@ -13,18 +13,33 @@
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
+#include "hardware/watchdog.h"
 #include "sd_spi.h"
 #include "vmem_fb.h"
 
 #define VIEWPORT_WIDTH   80
 #define VIEWPORT_HEIGHT  32
 
+// Statically allocated in BSS (not on stack)
 static char terminal_buf[VIEWPORT_HEIGHT][VIEWPORT_WIDTH];
 static char output_str[16384];
 
+// Custom Hard Fault Handler to trap any crash and prevent silent hardware resets
+void isr_hardfault(void) {
+#ifdef PICO_DEFAULT_LED_PIN
+    gpio_put(PICO_DEFAULT_LED_PIN, 1);
+#endif
+    printf("\n\n======================================================\n");
+    printf("   [CRITICAL] HARD FAULT / CRASH DETECTED ON PICO 2!\n");
+    printf("   System execution halted to preserve crash state.\n");
+    printf("======================================================\n\n");
+    while (1) {
+        tight_loop_contents();
+    }
+}
+
 // Draw a 3D wireframe cube directly into the Virtual Memory space
 static void vmem_render_3d_cube(int center_x, int center_y, float size, float rx, float ry, float rz, char ch) {
-    // 8 vertices of unit cube
     static const float base_v[8][3] = {
         {-1,-1,-1}, {1,-1,-1}, {1,1,-1}, {-1,1,-1},
         {-1,-1,1},  {1,-1,1},  {1,1,1},  {-1,1,1}
@@ -71,13 +86,15 @@ static void vmem_render_3d_cube(int center_x, int center_y, float size, float rx
 
 // Generate a massive 1,000,000 byte 3D landscape on the SD card
 static void generate_massive_world(void) {
-    printf("[RENDER] Initializing 1,000,000 byte Virtual World on MicroSD...\n");
+    printf("[RENDER] >>> Phase 1: Formatting 1,000,000 byte Canvas on MicroSD <<<\n");
     vmem_clear(' ');
 
     // 1. Draw outer boundary box (1000 x 1000)
+    printf("[RENDER] >>> Phase 2: Drawing 1000x1000 Boundary Box <<<\n");
     vmem_draw_box(0, 0, VMEM_WIDTH, VMEM_HEIGHT);
 
     // 2. Draw coordinate grid lines every 100 characters
+    printf("[RENDER] >>> Phase 3: Drawing Grid Coordinate Matrix <<<\n");
     for (int x = 100; x < VMEM_WIDTH; x += 100) {
         for (int y = 10; y < VMEM_HEIGHT - 10; y += 4) {
             vmem_put_pixel(x, y, ':');
@@ -90,7 +107,8 @@ static void generate_massive_world(void) {
     }
 
     // 3. Draw a constellation of 3D cubes of various sizes across virtual space
-    printf("[RENDER] Paging 3D Cubes into Virtual Framebuffer...\n");
+    printf("[RENDER] >>> Phase 4: Paging 3D Cubes constellation into Virtual Memory <<<\n");
+    int cube_count = 0;
     for (int gy = 150; gy < VMEM_HEIGHT - 100; gy += 200) {
         for (int gx = 150; gx < VMEM_WIDTH - 100; gx += 200) {
             float size = 25.0f + 10.0f * sinf((float)(gx + gy) * 0.05f);
@@ -100,10 +118,13 @@ static void generate_massive_world(void) {
             char label[32];
             snprintf(label, sizeof(label), "[SECTOR %03d,%03d]", gx, gy);
             vmem_draw_string(gx - 8, gy + (int)size + 3, label);
+            cube_count++;
         }
     }
+    printf("[RENDER] Rendered %d 3D cubes across virtual space.\n", cube_count);
 
     // 4. Draw Center Mega Landmark
+    printf("[RENDER] >>> Phase 5: Rendering Center Mega Landmark <<<\n");
     vmem_draw_box(400, 420, 200, 160);
     vmem_draw_string(410, 430, "=== PICO 2 (RP2350) OUT-OF-CORE VIRTUAL MEMORY ===");
     vmem_draw_string(410, 445, "CANVAS SIZE : 1000 x 1000 CHARACTERS (1.00 MEGABYTE)");
@@ -112,12 +133,15 @@ static void generate_massive_world(void) {
     vmem_render_3d_cube(500, 520, 35.0f, 0.6f, 0.8f, 0.4f, '@');
 
     // 5. Commit all modified pages to MicroSD card
-    printf("[RENDER] Flushing dirty pages to SD card...\n");
+    printf("[RENDER] >>> Phase 6: Committing all modified pages to MicroSD <<<\n");
     vmem_flush();
-    printf("[RENDER] Virtual World Generation Complete!\n");
+    printf("[RENDER] >>> Virtual World Generation Successfully Finished! <<<\n");
 }
 
 int main(void) {
+    // Disable any hardware watchdog that might have been left running
+    watchdog_reboot(0, 0, 0); // No reboot
+
     stdio_init_all();
 
 #ifdef PICO_DEFAULT_LED_PIN
@@ -155,8 +179,8 @@ int main(void) {
     uint32_t frame_count = 0;
     uint32_t sys_hz = clock_get_hz(clk_sys);
 
-    printf("\nStarting Real-time Paging Viewport Streamer...\n");
-    sleep_ms(1000);
+    printf("\nStarting Real-time Paging Viewport Streamer in 2 seconds...\n");
+    sleep_ms(2000);
 
     while (1) {
         uint64_t frame_start_us = time_us_64();

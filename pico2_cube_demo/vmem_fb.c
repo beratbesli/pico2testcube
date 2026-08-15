@@ -12,7 +12,9 @@ typedef struct {
     uint8_t  data[VMEM_PAGE_SIZE];
 } vmem_slot_t;
 
+// Static allocation (in BSS, NOT on stack)
 static vmem_slot_t  g_cache[VMEM_CACHE_SLOTS];
+static uint8_t      g_clear_block[VMEM_PAGE_SIZE];
 static uint32_t     g_base_sector = 0;
 static uint32_t     g_access_counter = 0;
 static vmem_stats_t g_stats = {0};
@@ -48,13 +50,19 @@ static int vmem_acquire_slot(uint32_t page_id) {
 
     // 3. Write-back dirty victim page to SD card
     if (g_cache[victim_idx].valid && g_cache[victim_idx].dirty) {
-        sd_write_sector(g_base_sector + g_cache[victim_idx].page_id, g_cache[victim_idx].data);
+        bool ok = sd_write_sector(g_base_sector + g_cache[victim_idx].page_id, g_cache[victim_idx].data);
+        if (!ok) {
+            printf("[VMEM] Warning: Writeback failed for Page %u!\n", g_cache[victim_idx].page_id);
+        }
         g_stats.sd_writes++;
         g_cache[victim_idx].dirty = false;
     }
 
     // 4. Page-In requested sector from SD card
-    sd_read_sector(g_base_sector + page_id, g_cache[victim_idx].data);
+    bool ok = sd_read_sector(g_base_sector + page_id, g_cache[victim_idx].data);
+    if (!ok) {
+        printf("[VMEM] Warning: Read failed for Page %u!\n", page_id);
+    }
     g_stats.sd_reads++;
 
     g_cache[victim_idx].page_id = page_id;
@@ -84,12 +92,30 @@ bool vmem_init(uint32_t base_sd_sector) {
 }
 
 void vmem_clear(char fill_char) {
-    uint8_t block[VMEM_PAGE_SIZE];
-    memset(block, fill_char, VMEM_PAGE_SIZE);
+    memset(g_clear_block, fill_char, VMEM_PAGE_SIZE);
 
-    // Write directly to all virtual pages on SD card
+    printf("[VMEM] Formatting Virtual Canvas on SD (%u sectors)...\n", VMEM_TOTAL_PAGES);
+
+    // Write directly to all virtual pages on SD card with live progress reporting
+    uint32_t failed_count = 0;
+    uint64_t start_time = time_us_64();
+
     for (uint32_t p = 0; p < VMEM_TOTAL_PAGES; p++) {
-        sd_write_sector(g_base_sector + p, block);
+        bool ok = sd_write_sector(g_base_sector + p, g_clear_block);
+        if (!ok) {
+            failed_count++;
+            if (failed_count <= 5) {
+                printf("[VMEM ERROR] Write failed at sector %u (LBA: %lu)!\n", p, (unsigned long)(g_base_sector + p));
+            }
+        }
+
+        // Print progress every 200 sectors and at the end
+        if ((p + 1) % 200 == 0 || (p + 1) == VMEM_TOTAL_PAGES) {
+            uint32_t elapsed_ms = (uint32_t)((time_us_64() - start_time) / 1000ULL);
+            printf("  -> Written sector %u / %u (%.1f%%) | Time: %u ms | Errors: %u\r\n", 
+                   p + 1, VMEM_TOTAL_PAGES, ((p + 1) * 100.0f) / (float)VMEM_TOTAL_PAGES,
+                   elapsed_ms, failed_count);
+        }
     }
 
     // Invalidate RAM cache
@@ -97,6 +123,8 @@ void vmem_clear(char fill_char) {
         g_cache[i].valid = false;
         g_cache[i].dirty = false;
     }
+
+    printf("[VMEM] Format Complete! Total Errors: %u\n", failed_count);
 }
 
 void vmem_put_pixel(int x, int y, char ch) {
@@ -167,13 +195,19 @@ void vmem_draw_box(int x, int y, int w, int h) {
 }
 
 void vmem_flush(void) {
+    uint32_t flushed = 0;
     for (int i = 0; i < VMEM_CACHE_SLOTS; i++) {
         if (g_cache[i].valid && g_cache[i].dirty) {
-            sd_write_sector(g_base_sector + g_cache[i].page_id, g_cache[i].data);
+            bool ok = sd_write_sector(g_base_sector + g_cache[i].page_id, g_cache[i].data);
+            if (!ok) {
+                printf("[VMEM] Flush error at page %u!\n", g_cache[i].page_id);
+            }
             g_cache[i].dirty = false;
             g_stats.sd_writes++;
+            flushed++;
         }
     }
+    printf("[VMEM] Flushed %u dirty pages to SD card.\n", flushed);
 }
 
 vmem_stats_t vmem_get_stats(void) {

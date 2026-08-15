@@ -19,13 +19,13 @@ add_executable(pico2_cube_demo
     vmem_fb.c
 )
 
-# Pull in core SDK libraries and hardware SPI
+# Pull in core SDK libraries, hardware SPI, and clocks
 target_link_libraries(pico2_cube_demo
     pico_stdlib
     hardware_spi
     hardware_clocks
     hardware_gpio
-    pico_multicore
+    hardware_watchdog
 )
 
 # Enable USB CDC stdio, disable UART
